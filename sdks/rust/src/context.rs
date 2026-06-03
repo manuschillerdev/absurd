@@ -159,23 +159,13 @@ impl TaskContext {
             return Ok(cached);
         }
 
-        // Check if we resumed due to timeout
-        if self.task.wake_event.as_deref() == Some(event_name)
-            && self.task.event_payload.is_none()
-        {
-            return Err(Error::EventTimeout(
-                event_name.to_string(),
-                options.timeout_secs.unwrap_or(0),
-            ));
-        }
-
         let checkpoint_name = self.advance_checkpoint_name(step_name);
         let timeout_secs = options.timeout_secs.map(|t| t as i32);
 
         let rows = self
             .client
             .query(
-                "SELECT should_suspend, payload
+                "SELECT *
                  FROM absurd.await_event($1, $2, $3, $4, $5, $6)",
                 &[
                     &self.queue_name,
@@ -200,13 +190,43 @@ impl TaskContext {
             return Err(Error::Other("await_event returned no rows".to_string()));
         }
 
-        let should_suspend: bool = rows[0].get(0);
-        let payload: Option<Json> = rows[0].get(1);
+        let row = &rows[0];
+        let columns = row.columns();
+        let has_timed_out_column = columns.iter().any(|column| column.name() == "timed_out");
+        let supports_timed_out = match columns.len() {
+            2 => false,
+            3 if has_timed_out_column => true,
+            count => {
+                return Err(Error::Other(format!(
+                    "await_event returned unexpected column count: {}",
+                    count
+                )));
+            }
+        };
+
+        let should_suspend: bool = row.try_get("should_suspend")?;
+        let payload: Option<Json> = row.try_get("payload")?;
+        let timed_out = supports_timed_out && row.try_get::<_, bool>("timed_out")?;
+        let legacy_timed_out = !supports_timed_out
+            && !should_suspend
+            && payload.is_none()
+            && self.task.wake_event.as_deref() == Some(event_name)
+            && self.task.event_payload.is_none();
+
+        if timed_out || legacy_timed_out {
+            self.task.wake_event = None;
+            self.task.event_payload = None;
+            return Err(Error::EventTimeout(
+                event_name.to_string(),
+                options.timeout_secs.unwrap_or(0),
+            ));
+        }
 
         if !should_suspend {
             let payload = payload.unwrap_or(Json::Null);
             self.checkpoint_cache
                 .insert(checkpoint_name, payload.clone());
+            self.task.event_payload = None;
             return Ok(payload);
         }
 
